@@ -473,14 +473,35 @@ class variational_posterior:
     # The score() method is already implemented and can be used later
     # when implementing inference (with REINFORCE leave-one-out estimator).
 
-    def __init__(self):
-        raise NotImplementedError
+    def __init__(self, theta):
+        self.theta = theta  # store variational parameters (e.g., mean and covariance)
+        self.shape = np.exp(theta[0])  # shape parameter for gamma
+        self.scale = np.exp(theta[1])  # scale parameter for gamma
 
-    def logpdf(self):
-        raise NotImplementedError
+        self.Sigma = D_from_theta(theta[2:8])  # covariance matrix for Wishart
+
+        self.df = np.exp(theta[8]) + 2 # degress of freedom for Wishart
+
+    def logpdf(self, S0, D):
+        logpdf_S0 = gamma.logpdf(S0, a=self.shape, scale=self.scale)
+
+        # wishart logpdf does not support batching so we iterate if D is batched
+        if D.ndim == 3:
+            logpdf_D = np.array([wishart.logpdf(d, df=self.df, scale=self.Sigma) for d in D])
+        else:
+            logpdf_D = wishart.logpdf(D, df=self.df, scale=self.Sigma)
+
+        return logpdf_S0 + logpdf_D
     
     def rvs(self, size):
-        raise NotImplementedError
+        S0_samples = gamma.rvs(a=self.shape, scale=self.scale, size=size)
+
+        D_samples = wishart.rvs(df=self.df, scale=self.Sigma, size=size)
+        if size == 1:
+            D_samples = D_samples[np.newaxis, ...] # ensure D_samples has shape (1, 3, 3) for size=1
+        
+
+        evals_samples, evecs_samples = np.linalg.eigh(D_samples) # returns eigenvalues in ascending order
 
         return S0_samples, evals_samples, evecs_samples
 
@@ -489,8 +510,11 @@ class variational_posterior:
         score_wrt_log_shape, score_wrt_log_scale = self.gamma_score(S0)
         score_wrt_theta, score_wrt_log_df = self.wishart_score(D)
         return np.concatenate([
-            score_wrt_log_shape, score_wrt_log_scale, score_wrt_theta, score_wrt_log_df]
-        )
+            [score_wrt_log_shape], 
+            [score_wrt_log_scale], 
+            score_wrt_theta, 
+            [score_wrt_log_df]
+        ])
 
     def gamma_score(self, x):
         # Score function for gamma distribution
@@ -560,15 +584,83 @@ def importance_sampling(n_samples, gamma_param, nu_param):
 
 
 @disk_memoize()
-def variational_inference(max_iters, K, learning_rate):
+def variational_inference(max_iters, K, learning_rate, gtab, y, point_estimate):
     # Students: implement Variational Inference here.
     # Before starting, make sure the prior, likelihood and variational_posterior are implemented.
     # Note: you may change, add, or remove input parameters depending on your design
     # (e.g. pass initialization values like those prepared in main()).
+    S0_init, evals_init, evecs_init = point_estimate
+    D_init = compute_D(evals_init, evecs_init).squeeze() 
 
-    raise NotImplementedError
+    #initialize theta
+    theta = np.zeros(9)
+    theta[0] = 0.0
+    theta[1] = np.log(S0_init)
+    theta[2:8] = theta_from_D(D_init / 5.0)
+    theta[8] = np.log(3)
 
-    return variational_posterior(...)
+    # adam optimizer state 
+    m = np.zeros(9)
+    v = np.zeros(9)
+    beta1, beta2, epsilon = 0.9, 0.999, 1e-8
+
+    prior = frozen_prior()
+    likelihood = frozen_likelihood(gtab, y)
+
+    learning_curve = []
+
+
+    for iteration in range(1, max_iters + 1):
+        q = variational_posterior(theta)
+
+        S0_k, evals_k, evecs_k = q.rvs(size=K)
+        D_k = compute_D(evals_k, evecs_k)
+
+        f_z = np.zeros(K)
+        scores = np.zeros((K,9))
+
+        # compute scores for each particle 
+        for k in range(K):
+            # prior  p(z)
+            log_p_z = prior.logpdf(S0_k[k], evals_k[k], evecs_k[k])
+
+            # likelihood p(y|z)
+            log_p_y_z = likelihood.logpdf(S0_k[k], evecs_k[k], evals_k[k])
+
+            # log variational posterior q(z)
+            log_q_z = q.logpdf(S0_k[k], D_k[k])
+
+            f_z[k] = log_p_z + log_p_y_z - log_q_z
+            # nabla_teta log q(z)
+            scores[k] = q.score(S0_k[k], D_k[k])
+
+        # compute REINFORCE leave-one-out estimator, this lowers
+        # the variance of the gradient estimate
+        # we leave the current k since it would make the estimator suddenly biased 
+        #
+        grad = np.zeros(9)
+        for k in range(K):
+            # baseline: mean of f(z) excluding the k-th sample
+            baseline = np.sum(np.delete(f_z,k)) / (K - 1)
+            grad += (f_z[k] - baseline) * scores[k]
+
+        grad /= K
+
+        # adam update
+        m = beta1 * m + (1 - beta1) * grad
+        v = beta2 * v + (1 - beta2) * (grad ** 2)
+        m_hat = m / (1 - beta1 ** iteration)
+        v_hat = v / (1 - beta2 ** iteration)
+
+        theta += learning_rate * m_hat / (np.sqrt(v_hat) + epsilon)
+
+        grad_estimate = np.mean(f_z)
+        if iteration % 100 == 0:
+            print(f"Iteration {iteration}/{max_iters}, ELBO estimate: {grad_estimate:.4f}")
+
+        learning_curve.append(grad_estimate)
+
+    return variational_posterior(theta), learning_curve
 
 
 @disk_memoize()
@@ -600,16 +692,16 @@ def main():
 
     # Find principal eigenvector from DTI estimate (for plotting)
     evec_principal = evecs_init[:, 0]
-    frozen_prior_instance = frozen_prior()
+    # frozen_prior_instance = frozen_prior()
 
-    print(np.round(frozen_prior_instance.logpdf(S0_init, evals_init, evecs_init),3))
+    # print(np.round(frozen_prior_instance.logpdf(S0_init, evals_init, evecs_init),3))
 
-    frozen_likelihood_instance = frozen_likelihood(gtab, y)
-    print(np.round(frozen_likelihood_instance.logpdf(S0_init, evecs_init, evals_init),3))
+    # frozen_likelihood_instance = frozen_likelihood(gtab, y)
+    # print(np.round(frozen_likelihood_instance.logpdf(S0_init, evecs_init, evals_init),3))
 
     # Set random seed and number of posterior samples
-    # np.random.seed(0)
-    # n_samples = 10000
+    np.random.seed(0)
+    n_samples = 10000
 
     # # Run Metropolis–Hastings and plot results
     # S0_mh, evals_mh, evecs_mh = metropolis_hastings(force_recompute=False)
@@ -620,10 +712,21 @@ def main():
     # w_is, S0_is, evals_is, evecs_is = importance_sampling(force_recompute=False)
     # plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
 
-    # # Run Variational Inference and plot results
-    # posterior_vi = variational_inference(force_recompute=False)
-    # S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
-    # plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, method="vi")
+    # Run Variational Inference and plot results
+    MAX_ITERS = 5000
+    K = 64
+    LEARNING_RATE = 0.005
+    hyperparams = {
+        "max_iters": MAX_ITERS,
+        "K": K,
+        "learning_rate": LEARNING_RATE,
+    }
+    posterior_vi, learning_curve = variational_inference(max_iters = MAX_ITERS, K=K, learning_rate=LEARNING_RATE, 
+                                         gtab=gtab, y=y, point_estimate=point_estimate,
+                                         force_recompute=True)
+    S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
+    plot_learning_curve(learning_curve, hyperparams=hyperparams, method="vi")
+    plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, hyperparams, method="vi")
 
     # # Run Laplace Approximation and plot results
     # posterior_laplace = laplace_approximation(force_recompute=False)
@@ -632,8 +735,34 @@ def main():
 
     print("Done.")
 
+def plot_learning_curve(learning_curve, hyperparams, method="vi"):
+    """
+    Plot the learning curve of the ELBO estimate over iterations.
 
-def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
+    Parameters
+    ----------
+    learning_curve : list or ndarray
+        List of ELBO estimates at each iteration.
+    method : str
+        Name of inference method (used in output filename).
+    """
+    max_iters = hyperparams["max_iters"]
+    K = hyperparams["K"]
+    learning_rate = hyperparams["learning_rate"]
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(learning_curve, label='ELBO Estimate', color='blue')
+    plt.xlabel('Iteration')
+    plt.ylabel('ELBO Estimate')
+    plt.title(f'Learning Curve for {method.upper()} with max_iters={max_iters}, K={K}, learning_rate={learning_rate}')
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig(f"learning_curve_{method}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_results(S0, evals, evecs, evec_ref, hyperparams, weights=None, method=""):
     """
     Plot posterior results as histograms and save to file.
 
@@ -656,6 +785,11 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     method : str
         Name of inference method (used in output filename).
     """
+
+    max_iters = hyperparams["max_iters"]
+    K = hyperparams["K"]
+    learning_rate = hyperparams["learning_rate"]
+
     
     # Use uniform weights if none provided
     if weights is None:
@@ -696,6 +830,8 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
                     alpha=0.7, color='magenta', edgecolor='black')
     axes[1, 1].set_xlabel("Acute angle")
     axes[1, 1].set_ylabel("Density")
+
+    plt.title("Posterior distributions for VI with max_iters={}, K={}, learning_rate={}".format(max_iters, K, learning_rate), fontsize=16)
 
     # Adjust layout and save figure with method name
     plt.tight_layout()
