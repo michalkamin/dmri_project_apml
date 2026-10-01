@@ -713,8 +713,8 @@ def main():
     # plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
 
     # Run Variational Inference and plot results
-    MAX_ITERS = 5000
-    K = 64
+    MAX_ITERS = 10000
+    K = 32
     LEARNING_RATE = 0.005
     hyperparams = {
         "max_iters": MAX_ITERS,
@@ -810,6 +810,8 @@ def plot_results(S0, evals, evecs, evec_ref, hyperparams, weights=None, method="
     
     # Create 2x2 grid of histograms
     fig, axes = plt.subplots(2, 2, figsize=(12, 12), sharey=False)
+    # set title for the entire figure
+    fig.suptitle(f"Posterior Results for {method.upper()} with max_iters={max_iters}, K={K}, learning_rate={learning_rate}", fontsize=16)
 
     axes[0, 0].hist(S0, bins=n_bins, density=True, weights=weights, 
                     alpha=0.7, color='red', edgecolor='black')
@@ -831,7 +833,6 @@ def plot_results(S0, evals, evecs, evec_ref, hyperparams, weights=None, method="
     axes[1, 1].set_xlabel("Acute angle")
     axes[1, 1].set_ylabel("Density")
 
-    plt.title("Posterior distributions for VI with max_iters={}, K={}, learning_rate={}".format(max_iters, K, learning_rate), fontsize=16)
 
     # Adjust layout and save figure with method name
     plt.tight_layout()
