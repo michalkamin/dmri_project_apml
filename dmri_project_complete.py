@@ -78,7 +78,7 @@ from dipy.io.image import load_nifti, save_nifti   # for loading / saving imagin
 from dipy.io.gradients import read_bvals_bvecs     # for loading / saving our bvals and bvecs
 from dipy.core.gradients import gradient_table     # for constructing gradient table from bvals/bvecs
 from dipy.data import get_fnames                   # for small datasets that we use in tests and examples
-from dipy.segment.mask import median_otsu          # for masking out the background
+from dipy.segment.mask import median_otsu          # for masking out the background  # pyright: ignore[reportUnknownVariableType]
 import dipy.reconst.dti as dti                     # for diffusion tensor model fitting and metrics
 
 import argparse
@@ -1056,47 +1056,46 @@ def variational_inference(max_iters, K, learning_rate, gtab, y, point_estimate):
 
 
     for iteration in range(1, max_iters + 1):
-        q = variational_posterior(theta)
-
-        S0_k, evals_k, evecs_k = q.rvs(size=K)
-        D_k = compute_D(evals_k, evecs_k)
-
-        f_z = np.zeros(K)
-        scores = np.zeros((K,9))
-
-        # compute scores for each particle
-        for k in range(K):
-            # prior  p(z)
-            log_p_z = prior.logpdf(S0_k[k], evals_k[k], evecs_k[k])
-
-            # likelihood p(y|z)
-            log_p_y_z = likelihood.logpdf(S0_k[k], evecs_k[k], evals_k[k])
-
-            # log variational posterior q(z)
-            log_q_z = q.logpdf(S0_k[k], D_k[k])
-
-            f_z[k] = log_p_z + log_p_y_z - log_q_z
-            # nabla_teta log q(z)
-            scores[k] = q.score(S0_k[k], D_k[k])
-
-        # compute REINFORCE leave-one-out estimator, this lowers
-        # the variance of the gradient estimate
-        # we leave the current k since it would make the estimator suddenly biased
-        #
+        # 1. Back up the current safe parameters
+        theta_backup = np.copy(theta)
+        
+        try:
+            q = variational_posterior(theta)
+            S0_k, evals_k, evecs_k = q.rvs(size=K)
+            D_k = compute_D(evals_k, evecs_k)
+            
+            f_z = np.zeros(K)
+            scores = np.zeros((K, 9))
+            
+            for k in range(K):
+                log_p_z = prior.logpdf(S0_k[k], evals_k[k], evecs_k[k])
+                log_p_y_z = likelihood.logpdf(S0_k[k], evecs_k[k], evals_k[k])
+                log_q_z = q.logpdf(S0_k[k], D_k[k])
+                
+                f_z[k] = (log_p_y_z + log_p_z) - log_q_z
+                scores[k] = q.score(S0_k[k], D_k[k])
+                
+        except np.linalg.LinAlgError:
+            # If the matrix collapsed, revert to the backup and shrink the learning rate
+            print(f"Warning: Matrix collapsed at iteration {iteration}. Reverting and decaying learning rate.")
+            theta = theta_backup
+            learning_rate *= 0.9  # Decay learning rate by 10% to prevent repeated crashes
+            continue # Skip the rest of this iteration
+            
+        # 3. Compute REINFORCE leave-one-out gradient
         grad = np.zeros(9)
         for k in range(K):
-            # baseline: mean of f(z) excluding the k-th sample
-            baseline = np.sum(np.delete(f_z,k)) / (K - 1)
+            baseline = np.sum(np.delete(f_z, k)) / (K - 1)
             grad += (f_z[k] - baseline) * scores[k]
 
         grad /= K
-
-        # adam update
+        
+        # 4. Adam parameter update
         m = beta1 * m + (1 - beta1) * grad
         v = beta2 * v + (1 - beta2) * (grad ** 2)
         m_hat = m / (1 - beta1 ** iteration)
         v_hat = v / (1 - beta2 ** iteration)
-
+        
         theta += learning_rate * m_hat / (np.sqrt(v_hat) + epsilon)
 
         grad_estimate = np.mean(f_z)
@@ -1287,24 +1286,9 @@ def main():
     plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
     #plt.savefig("result_importance.png")
 
-     # Run Variational Inference and plot results
-    MAX_ITERS = 10000
-    K = 32
-    LEARNING_RATE = 0.005
-    hyperparams = {
-        "max_iters": MAX_ITERS,
-        "K": K,
-        "learning_rate": LEARNING_RATE,
-    }
-    posterior_vi, learning_curve = variational_inference(max_iters = MAX_ITERS, K=K, learning_rate=LEARNING_RATE,
-                                         gtab=gtab, y=y, point_estimate=point_estimate,
-                                         force_recompute=True)
-    S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
-    plot_learning_curve(learning_curve, hyperparams=hyperparams, method="vi")
-    plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, method="vi")
-    #plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, hyperparams, method="vi")
 
 
+    print("Running Laplace Approximation....")
      # Run the assigned method: Laplace approximation
     posterior_laplace = laplace_approximation(force_recompute=False)
     if posterior_laplace.optimizer_result is not None:
@@ -1320,6 +1304,26 @@ def main():
     )
 
     plot_results(S0_laplace, evals_laplace, evecs_laplace, evec_principal, method="laplace")
+
+     # Run Variational Inference and plot results
+
+    print("Running Variational Inference....")
+    MAX_ITERS = 5000
+    K = 32
+    LEARNING_RATE = 0.005
+    hyperparams = {
+        "max_iters": MAX_ITERS,
+        "K": K,
+        "learning_rate": LEARNING_RATE,
+    }
+    posterior_vi, learning_curve = variational_inference(max_iters = MAX_ITERS, K=K, learning_rate=LEARNING_RATE,
+                                        gtab=gtab, y=y, point_estimate=point_estimate,
+                                        force_recompute=True)
+    S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
+    plot_learning_curve(learning_curve, hyperparams=hyperparams, method="vi")
+    plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, method="vi")
+    #plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, hyperparams, method="vi")
+
 
     print("Done.")
 
