@@ -1261,17 +1261,33 @@ def main():
     np.random.seed(0)
     n_samples = 10000
 
-    # # Run Metropolis–Hastings and plot results
+    # Run MH and report summaries only after discarding burn-in.
+    from time import perf_counter
+    from dmri_project_mh import plot_mh_results
+
+    start_mh = perf_counter()
     S0_mh, evals_mh, evecs_mh, diagnostics = metropolis_hastings(
         n_samples=10000,
         gamma_param=0.01,
         nu_param=2000,
         random_seed=0,
         proposal_mode="mean_centered",
-        force_recompute=False,
+        force_recompute=True,
     )
-    burn_in = 0
-    plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
+    elapsed_mh = perf_counter() - start_mh
+    burn_in = 1000
+    summaries = posterior_summaries(S0_mh, evals_mh, evecs_mh, evec_principal, burn_in)
+    print(f"MH acceptance rate: {diagnostics['acceptance_rate']:.3%}")
+    print(f"MH burn-in: {burn_in}; retained samples: {len(S0_mh) - burn_in}")
+    for name, values in summaries.items():
+        print(f"MH {name}: mean={values['mean']:.8g}, "
+              f"95% CI=[{values['q025']:.8g}, {values['q975']:.8g}]")
+    ess_S0 = effective_sample_size(S0_mh[burn_in:])
+    ess_MD = effective_sample_size(np.mean(evals_mh[burn_in:], axis=-1))
+    print(f"MH ESS: S0={ess_S0:.1f}, MD={ess_MD:.1f}")
+    print(f"MH inference runtime: {elapsed_mh:.3f} seconds")
+    plot_mh_results(S0_mh, evals_mh, evecs_mh, evec_principal,
+                    diagnostics, burn_in, output_dir=".")
 
 
     # # Run Importance Sampling and plot results
