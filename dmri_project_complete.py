@@ -72,6 +72,7 @@ from scipy.stats import gamma, norm, wishart, multivariate_normal
 from scipy.spatial.transform import Rotation
 from scipy.special import logsumexp, digamma
 from scipy.optimize import minimize
+from scipy.special import multigammaln  # needed for Wishart logpdf for VI
 
 # DIPY: diffusion MRI utilities and models
 from dipy.io.image import load_nifti, save_nifti   # for loading / saving imaging datasets
@@ -470,53 +471,111 @@ They are NOT needed for Metropolis-Hastings or Importance Sampling.
 """
 
 class variational_posterior:
-    # Placeholder for variational posterior approximation.
-    # Hint: you may want to add input parameters to these methods.
-    # The score() method is already implemented and can be used later
-    # when implementing inference (with REINFORCE leave-one-out estimator).
+    """
+    Variational posterior  q(S0, D) = Gamma(S0; alpha, beta) * W(D; Sigma, nu)   (Eqs. 15-17).
+
+    Unconstrained parameter vector theta (9,), same order as the provided score():
+        theta[0]   = log alpha                 (Gamma shape)
+        theta[1]   = log beta                  (Gamma scale)
+        theta[2:8] = Cholesky parameters of Sigma, Eq. (18) / D_from_theta
+        theta[8]   = log(nu - 2)               (nu = exp(theta[8]) + 2 > 2)
+
+    Wishart convention (the one assumed by the provided wishart_score):
+        W = nu * D ~ Wishart(df=nu, scale=Sigma)   =>   E[D] = Sigma.
+    The density of D therefore carries the Jacobian factor nu^(p(p+1)/2).
+    Positive-definiteness of every sample is guaranteed by construction
+    (Bartlett decomposition), and of Sigma by the Cholesky parameterization.
+    The Wishart is implemented by hand because scipy.stats.wishart requires
+    df >= 3 while nu in (2, 3) is allowed by the parameterization.
+    """
+
+    p = 3  # dimension of D
 
     def __init__(self, theta):
-        self.theta = theta  # store variational parameters (e.g., mean and covariance)
-        self.shape = np.exp(theta[0])  # shape parameter for gamma
-        self.scale = np.exp(theta[1])  # scale parameter for gamma
+        theta = np.asarray(theta, dtype=float).ravel()
+        if theta.shape != (9,):
+            raise ValueError(f"theta must have 9 entries, got shape {theta.shape}")
+        self.theta = theta
+        self.shape = float(np.exp(theta[0]))          # alpha
+        self.scale = float(np.exp(theta[1]))          # beta
+        self.Sigma = D_from_theta(theta[2:8])         # (3, 3), SPD
+        self.df = float(np.exp(theta[8]) + 2.0)       # nu
 
-        self.Sigma = D_from_theta(theta[2:8])  # covariance matrix for Wishart
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def theta_from_moments(S0, D, rel_sd_S0=0.05, nu=200.0):
+        """
+        Build theta from a point estimate: E[S0] = S0 with coefficient of
+        variation rel_sd_S0 (Gamma: CV = 1/sqrt(alpha)), E[D] = D, df = nu.
+        D is projected onto the SPD cone first (eigenvalues floored at 1e-5),
+        since a least-squares tensor fit can have non-positive eigenvalues.
+        """
+        w, U = np.linalg.eigh(np.asarray(D, dtype=float))
+        D_spd = (U * np.maximum(w, 1e-5)) @ U.T
+        D_spd = 0.5 * (D_spd + D_spd.T)
+        alpha = 1.0 / rel_sd_S0 ** 2
+        beta = max(float(S0), 1e-3) / alpha
+        return np.concatenate([[np.log(alpha), np.log(beta)],
+                               theta_from_D(D_spd),
+                               [np.log(nu - 2.0)]])
 
-        self.df = np.exp(theta[8]) + 2 # degress of freedom for Wishart
+    # ------------------------------------------------------------------ #
+    def _wishart_logpdf(self, D):
+        """log density of D = W/nu, W ~ Wishart(nu, Sigma). D: (..., 3, 3)."""
+        p, nu = self.p, self.df
+        W = nu * np.asarray(D, dtype=float)
+        sign, logdet_W = np.linalg.slogdet(W)
+        _, logdet_Sigma = np.linalg.slogdet(self.Sigma)
+        tr = np.einsum('ij,...ji->...', np.linalg.inv(self.Sigma), W)    # tr(Sigma^-1 W)
+        out = (0.5 * (nu - p - 1) * logdet_W - 0.5 * tr
+               - 0.5 * nu * p * np.log(2.0) - 0.5 * nu * logdet_Sigma
+               - multigammaln(0.5 * nu, p)
+               + 0.5 * p * (p + 1) * np.log(nu))                           # dW = nu^6 dD
+        return np.where(sign > 0, out, -np.inf)
 
     def logpdf(self, S0, D):
-        logpdf_S0 = gamma.logpdf(S0, a=self.shape, scale=self.scale)
+        """log q(S0, D) = log Gamma(S0; alpha, beta) + log W(D). Batched over leading dims."""
+        S0 = np.asarray(S0, dtype=float)
+        return gamma.logpdf(S0, a=self.shape, scale=self.scale) + self._wishart_logpdf(D)
 
-        # wishart logpdf does not support batching so we iterate if D is batched
-        if D.ndim == 3:
-            logpdf_D = np.array([wishart.logpdf(d, df=self.df, scale=self.Sigma) for d in D])
-        else:
-            logpdf_D = wishart.logpdf(D, df=self.df, scale=self.Sigma)
+    # ------------------------------------------------------------------ #
+    def sample(self, size, rng=None):
+        """Draw (S0, D): S0 (size,), D (size, 3, 3), D symmetric positive definite."""
+        rng = np.random.mtrand._rand if rng is None else rng   # global state -> respects np.random.seed
+        S0 = rng.gamma(shape=self.shape, scale=self.scale, size=size)
+        # Bartlett decomposition (valid for real nu > p - 1):  W = (Lc B)(Lc B)^T
+        B = np.zeros((size, self.p, self.p))
+        for i in range(self.p):
+            B[:, i, i] = np.sqrt(rng.chisquare(self.df - i, size=size))
+        rows, cols = np.tril_indices(self.p, k=-1)
+        B[:, rows, cols] = rng.standard_normal((size, len(rows)))
+        A = np.linalg.cholesky(self.Sigma) @ B
+        D = A @ np.swapaxes(A, -1, -2) / self.df
+        return S0, 0.5 * (D + np.swapaxes(D, -1, -2))
 
-        return logpdf_S0 + logpdf_D
-
-    def rvs(self, size):
-        S0_samples = gamma.rvs(a=self.shape, scale=self.scale, size=size)
-
-        D_samples = wishart.rvs(df=self.df, scale=self.Sigma, size=size)
-        if size == 1:
-            D_samples = D_samples[np.newaxis, ...] # ensure D_samples has shape (1, 3, 3) for size=1
-
-
-        evals_samples, evecs_samples = np.linalg.eigh(D_samples) # returns eigenvalues in ascending order
-
+    def rvs(self, size, rng=None):
+        """
+        Samples in the format used by plot_results: S0 (size,), evals (size, 3)
+        and evecs (size, 3, 3) from the eigendecomposition D = V diag(evals) V^T.
+        np.linalg.eigh returns ascending eigenvalues, so the principal
+        eigenvector is evecs[:, :, 2] (what plot_results expects). V is in SO(3).
+        """
+        S0_samples, D = self.sample(size, rng)
+        evals_samples, evecs_samples = np.linalg.eigh(D)
+        flip = np.linalg.det(evecs_samples) < 0
+        evecs_samples[flip, :, 0] *= -1          # det = +1  ->  V in SO(3)
         return S0_samples, evals_samples, evecs_samples
 
+    # ------------------------------------------------------------------ #
     def score(self, S0, D):
+        """grad_theta log q_theta(S0, D) for ONE sample (S0 scalar/(1,), D (3,3)), shape (9,)."""
         # Combine score contributions from gamma and Wishart parts
         score_wrt_log_shape, score_wrt_log_scale = self.gamma_score(S0)
         score_wrt_theta, score_wrt_log_df = self.wishart_score(D)
+        # FIX: the gamma / df parts are 0-d for scalar input and cannot be concatenated as-is
         return np.concatenate([
-            [score_wrt_log_shape],
-            [score_wrt_log_scale],
-            score_wrt_theta,
-            [score_wrt_log_df]
-        ])
+            np.atleast_1d(score_wrt_log_shape), np.atleast_1d(score_wrt_log_scale),
+            np.atleast_1d(score_wrt_theta), np.atleast_1d(score_wrt_log_df)])
 
     def gamma_score(self, x):
         # Score function for gamma distribution
@@ -536,9 +595,13 @@ class variational_posterior:
         _, logdet_W = np.linalg.slogdet(W)
         _, logdet_Sigma = np.linalg.slogdet(self.Sigma)
         digamma_sum = np.sum([digamma((self.df + 1 - j) / 2.0) for j in range(1, p+1)])
-        score_wrt_log_df = ((self.df - 2) / 2) * (logdet_W - p * np.log(2) - logdet_Sigma - digamma_sum)
+        # FIX: the variable of q is D = W/nu (not W), so d/d(nu) at fixed D has the extra
+        # term -(tr(Sigma^-1 D) - p)/2 (from W = nu*D and the Jacobian nu^(p(p+1)/2)).
+        # Verified against finite differences in vi_sanity_checks().
+        score_wrt_log_df = ((self.df - 2) / 2) * (
+            logdet_W - p * np.log(2) - logdet_Sigma - digamma_sum
+            - (np.trace(Sigma_inv @ D) - p))
         return score_wrt_theta, score_wrt_log_df
-
 
 
 class mvn_reparameterized:
@@ -1028,83 +1091,150 @@ def importance_sampling(n_samples, gamma_param, nu_param,
     return importance_weights, S0_samples, evals_samples, evecs_samples, eff_sample_size
 
 
+# helper functions for VI
+
+def log_joint_D(S0, D, prior, likelihood, include_jacobian=True):
+    """
+    Vectorized log p(y, S0, D) for a batch of K samples, parameterized by the
+    diffusion tensor D itself (needed because q(D) is a distribution over D).
+
+    The model (Eqs. 6-9) places its prior on (S0, lambda, V), not on D.
+    Mapping the prior on (lambda, V) to a density w.r.t. Lebesgue measure on
+    the symmetric matrix D requires the change-of-variables Jacobian
+        dD = prod_{i<j} |lambda_i - lambda_j| dlambda dV,
+    hence   log p(D) = sum_i log Gamma(lambda_i) - sum_{i<j} log|lambda_i-lambda_j| + const.
+    (V is uniform => constant.) Set include_jacobian=False to drop that term
+    (i.e. to treat the Gamma prior as if it were directly a prior on the
+    eigenvalues of D); both options are reported in main().
+
+    The sum over measurements is kept per sample, unlike frozen_likelihood.logpdf
+    which sums over everything (its value for one sample is checked against this
+    function in vi_sanity_checks).
+
+    Parameters
+    ----------
+    S0 : (K,) or scalar     D : (K, 3, 3) or (3, 3)
+    Returns
+    -------
+    (K,) array (up to an additive constant that does not depend on S0, D).
+    """
+    S0 = np.atleast_1d(np.asarray(S0, dtype=float))
+    D = np.asarray(D, dtype=float)
+    if D.ndim == 2:
+        D = D[None]
+    evals = np.linalg.eigvalsh(D)                                   # (K, 3), ascending
+
+    # Likelihood: same forward model as frozen_likelihood.logpdf
+    q = np.sqrt(likelihood.gtab.bvals[:, None]) * likelihood.gtab.bvecs   # (M, 3)
+    quad = np.einsum('mi,kij,mj->km', q, D, q)                      # (K, M)  x^T D x
+    S = S0[:, None] * np.exp(-quad)
+    loglik = np.sum(norm.logpdf(likelihood.y, loc=S, scale=likelihood.sigma), axis=1)
+
+    # Prior
+    logprior = gamma.logpdf(S0, a=prior.alpha_S, scale=prior.theta_S)
+    logprior = logprior + np.sum(
+        gamma.logpdf(evals, a=prior.alpha_l, scale=prior.theta_l), axis=1)
+    if include_jacobian:
+        gaps = np.stack([evals[:, 1] - evals[:, 0],
+                         evals[:, 2] - evals[:, 1],
+                         evals[:, 2] - evals[:, 0]], axis=1)
+        logprior = logprior - np.sum(np.log(np.maximum(gaps, 1e-300)), axis=1)
+
+    return loglik + logprior
+
+
+
+
+
+
 @disk_memoize()
-def variational_inference(max_iters, K, learning_rate, gtab, y, point_estimate):
-    # Students: implement Variational Inference here.
-    # Before starting, make sure the prior, likelihood and variational_posterior are implemented.
-    # Note: you may change, add, or remove input parameters depending on your design
-    # (e.g. pass initialization values like those prepared in main()).
-    S0_init, evals_init, evecs_init = point_estimate
-    D_init = compute_D(evals_init, evecs_init).squeeze()
+def variational_inference(max_iters, K, learning_rate, y, gtab, S0_init, D_init,
+                          seed=0, include_jacobian=True, sigma=29,
+                          rel_sd_S0=0.05, nu_init=200.0, avg_frac=0.2, verbose=True):
+    """
+    Fit q(S0, D) = Gamma x Wishart by maximizing the ELBO with the REINFORCE
+    leave-one-out gradient estimator (Eqs. 19-20) and Adam (gradient ASCENT).
 
-    #initialize theta
-    theta = np.zeros(9)
-    theta[0] = 0.0
-    theta[1] = np.log(S0_init)
-    theta[2:8] = theta_from_D(D_init / 5.0)
-    theta[8] = np.log(3)
+    Parameters
+    ----------
+    max_iters, K, learning_rate : number of Adam steps, MC samples per step, base step size.
+    y, gtab, sigma              : voxel signal, gradient table, noise std (likelihood).
+    S0_init, D_init             : point estimate used to initialize q (D_init need not be SPD).
+    seed                        : seed of the local RNG (results are reproducible).
+    include_jacobian            : see log_joint_D.
+    rel_sd_S0, nu_init          : initial width of q(S0) (coefficient of variation) and df of q(D).
+    avg_frac                    : the returned theta is the average over the last avg_frac of the
+                                  iterations (Polyak-Ruppert averaging; REINFORCE is noisy).
 
-    # adam optimizer state
-    m = np.zeros(9)
-    v = np.zeros(9)
-    beta1, beta2, epsilon = 0.9, 0.999, 1e-8
-
+    Returns
+    -------
+    variational_posterior with extra attributes
+        .elbo_history  (max_iters,)  per-iteration MC estimate of the ELBO (mean of f over the K samples)
+        .theta_history (max_iters, 9)
+        .theta_last    parameters at the last iteration (before averaging)
+        .final_elbo    ELBO re-estimated with 20000 fresh samples at the returned parameters
+    """
     prior = frozen_prior()
-    likelihood = frozen_likelihood(gtab, y)
+    likelihood = frozen_likelihood(gtab, y, sigma=sigma)
+    rng = np.random.default_rng(seed)
 
-    learning_curve = []
+    theta = variational_posterior.theta_from_moments(S0_init, D_init, rel_sd_S0, nu_init)
 
+    # Adam state. The theta entries live on very different scales: log-parameters are O(1)
+    # but the *off-diagonal* Cholesky entries (theta[3], theta[5], theta[6]) have the
+    # scale of sqrt(diffusivity) ~ 0.03. A common step size would wreck them, so their
+    # step is scaled by the typical Cholesky diagonal (equivalent to optimizing
+    # theta_k / scale_k; Adam is otherwise invariant to the gradient scale).
+    lr_scale = np.ones(9)
+    L0 = np.linalg.cholesky(D_from_theta(theta[2:8]))
+    lr_scale[[3, 5, 6]] = np.mean(np.diag(L0))
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    m, v = np.zeros(9), np.zeros(9)
 
-    for iteration in range(1, max_iters + 1):
-        # 1. Back up the current safe parameters
-        theta_backup = np.copy(theta)
-        
-        try:
-            q = variational_posterior(theta)
-            S0_k, evals_k, evecs_k = q.rvs(size=K)
-            D_k = compute_D(evals_k, evecs_k)
-            
-            f_z = np.zeros(K)
-            scores = np.zeros((K, 9))
-            
-            for k in range(K):
-                log_p_z = prior.logpdf(S0_k[k], evals_k[k], evecs_k[k])
-                log_p_y_z = likelihood.logpdf(S0_k[k], evecs_k[k], evals_k[k])
-                log_q_z = q.logpdf(S0_k[k], D_k[k])
-                
-                f_z[k] = (log_p_y_z + log_p_z) - log_q_z
-                scores[k] = q.score(S0_k[k], D_k[k])
-                
-        except np.linalg.LinAlgError:
-            # If the matrix collapsed, revert to the backup and shrink the learning rate
-            print(f"Warning: Matrix collapsed at iteration {iteration}. Reverting and decaying learning rate.")
-            theta = theta_backup
-            learning_rate *= 0.9  # Decay learning rate by 10% to prevent repeated crashes
-            continue # Skip the rest of this iteration
-            
-        # 3. Compute REINFORCE leave-one-out gradient
-        grad = np.zeros(9)
-        for k in range(K):
-            baseline = np.sum(np.delete(f_z, k)) / (K - 1)
-            grad += (f_z[k] - baseline) * scores[k]
+    elbo_hist = np.full(max_iters, np.nan)
+    theta_hist = np.zeros((max_iters, 9))
+    n_skipped = 0
 
-        grad /= K
-        
-        # 4. Adam parameter update
+    for t in range(1, max_iters + 1):
+        q = variational_posterior(theta)
+        S0_k, D_k = q.sample(K, rng)
+
+        # f(z) = log p(D, z) - log q(z)
+        f = log_joint_D(S0_k, D_k, prior, likelihood, include_jacobian) - q.logpdf(S0_k, D_k)
+        elbo_hist[t - 1] = np.mean(f)
+        theta_hist[t - 1] = theta
+        if not np.all(np.isfinite(f)):          # should not happen; never let NaNs into Adam
+            n_skipped += 1
+            continue
+
+        # REINFORCE leave-one-out: f_k - mean_{j != k} f_j   (Eq. 20)
+        f_loo = f - (np.sum(f) - f) / (K - 1)
+        scores = np.stack([q.score(S0_k[k:k + 1], D_k[k]) for k in range(K)])     # (K, 9)
+        grad = np.mean(f_loo[:, None] * scores, axis=0)                          # (9,)
+
+        # Adam ascent step with cosine-decayed learning rate (to 10 % of the base value)
+        lr_t = learning_rate * (0.1 + 0.45 * (1 + np.cos(np.pi * t / max_iters)))
         m = beta1 * m + (1 - beta1) * grad
-        v = beta2 * v + (1 - beta2) * (grad ** 2)
-        m_hat = m / (1 - beta1 ** iteration)
-        v_hat = v / (1 - beta2 ** iteration)
-        
-        theta += learning_rate * m_hat / (np.sqrt(v_hat) + epsilon)
+        v = beta2 * v + (1 - beta2) * grad ** 2
+        m_hat, v_hat = m / (1 - beta1 ** t), v / (1 - beta2 ** t)
+        theta = theta + lr_t * lr_scale * m_hat / (np.sqrt(v_hat) + eps)
 
-        grad_estimate = np.mean(f_z)
-        if iteration % 100 == 0:
-            print(f"Iteration {iteration}/{max_iters}, ELBO estimate: {grad_estimate:.4f}")
+        if verbose and (t % max(1, max_iters // 10) == 0):
+            print(f"[VI] iter {t:6d}/{max_iters}  ELBO (last 100 it.) = "
+                  f"{np.nanmean(elbo_hist[max(0, t - 100):t]):12.2f}")
 
-        learning_curve.append(grad_estimate)
+    # Polyak-Ruppert average of the iterates over the last avg_frac of the run
+    n_avg = max(1, int(avg_frac * max_iters))
+    posterior = variational_posterior(theta_hist[-n_avg:].mean(axis=0))
+    posterior.theta_last = theta
+    posterior.elbo_history = elbo_hist
+    posterior.theta_history = theta_hist
+    posterior.n_skipped = n_skipped
 
-    return variational_posterior(theta), learning_curve
+    S0_e, D_e = posterior.sample(20000, rng)
+    posterior.final_elbo = float(np.mean(
+        log_joint_D(S0_e, D_e, prior, likelihood, include_jacobian) - posterior.logpdf(S0_e, D_e)))
+    return posterior 
 
 
 
@@ -1308,21 +1438,14 @@ def main():
      # Run Variational Inference and plot results
 
     print("Running Variational Inference....")
-    MAX_ITERS = 5000
-    K = 32
-    LEARNING_RATE = 0.005
-    hyperparams = {
-        "max_iters": MAX_ITERS,
-        "K": K,
-        "learning_rate": LEARNING_RATE,
-    }
-    posterior_vi, learning_curve = variational_inference(max_iters = MAX_ITERS, K=K, learning_rate=LEARNING_RATE,
-                                        gtab=gtab, y=y, point_estimate=point_estimate,
-                                        force_recompute=True)
+    posterior_vi = variational_inference(max_iters=2000, K=100, learning_rate=0.01,
+                                         y=y, gtab=gtab, S0_init=S0_init, D_init=D_init,
+                                         seed=0, include_jacobian=True, sigma=29,
+                                         rel_sd_S0=0.05, nu_init=200.0, avg_frac=0.2,
+                                         verbose=True)
     S0_vi, evals_vi, evecs_vi = posterior_vi.rvs(size=n_samples)
-    plot_learning_curve(learning_curve, hyperparams=hyperparams, method="vi")
     plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, method="vi")
-    #plot_results(S0_vi, evals_vi, evecs_vi, evec_principal, hyperparams, method="vi")
+    plot_learning_curve(posterior_vi.elbo_history, hyperparams={"max_iters": 2000, "K": 100, "learning_rate": 0.01}, method="vi")
 
 
     print("Done.")
