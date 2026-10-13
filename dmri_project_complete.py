@@ -1,5 +1,3 @@
-
-
 """
 ===============================================================================
 Bayesian Inference in Diffusion Tensor Imaging - Project Template
@@ -912,12 +910,9 @@ def log_abs_det_z_wrt_theta(theta):
 
 
 
-
-
-
 @disk_memoize()
 def importance_sampling(n_samples, gamma_param, nu_param,
-                        laplace_prior=False, random_seed=0):
+                        proposal="original", random_seed=0):
     # Fixed reference point for the proposal
     y, point_estimate, gtab = get_preprocessed_data(force_recompute=False)
     S0_ref, evals_ref, evecs_ref = point_estimate
@@ -927,6 +922,7 @@ def importance_sampling(n_samples, gamma_param, nu_param,
     prior=frozen_prior()
     frozen_prior_instance = frozen_prior()
     likelihood=frozen_likelihood(gtab, y)
+    rng = np.random.default_rng(random_seed)
 
     # Check proposal parameters.
     #if proposal not in ("original", "laplace"):
@@ -937,158 +933,114 @@ def importance_sampling(n_samples, gamma_param, nu_param,
         raise ValueError("For a 3x3 Wishart distribution, nu_param must be > 2.")
     if n_samples <= 0:
         raise ValueError("n_samples must be a positive integer.")
-    #scale wrong
+    if proposal not in ("original", "laplace"):
+        raise ValueError("proposal must be 'original' or 'laplace'.")
 
 
-    rng = np.random.default_rng(random_seed)
 
+    if proposal == "original":
+        # Gamma proposal
+        gamma_shape = gamma_param ** (-2)
+        gamma_scale = gamma_param ** 2 * S0_ref
 
-    # Gamma proposal parameters
-    gamma_shape = gamma_param ** (-2)
-    gamma_scale = gamma_param ** 2 * S0_ref
+        # Wishart proposal 
+        wishart_scale = D_ref / nu_param
 
-# Wishart proposal parameters
-    wishart_scale = D_ref/nu_param
-
-# Draw independent samples
-    S0_samples = gamma.rvs(
-      a=gamma_shape,
-      scale=gamma_scale,
-      size=n_samples,
-      random_state=rng
-)
-
-    D_samples = wishart.rvs(
-      df=nu_param,
-      scale=wishart_scale,
-      size=n_samples,
-      random_state=rng
-)
-
-
-    # Convert samples to eigenvalues and eigenvectors
-    evals_samples = np.empty((n_samples, 3))
-    evecs_samples = np.empty((n_samples, 3, 3))
-
-
-    for i in range(n_samples):
-        evals_samples[i], evecs_samples[i] = np.linalg.eigh(D_samples[i])
-
-
-    # Evaluate log q
-    # Proposal density in z=(S0,D) coordinates
-    log_q_s0= gamma.logpdf(S0_samples, a=gamma_shape, scale=gamma_scale)
-    log_q_D = np.array([wishart.logpdf(D_samples[i], df=nu_param, scale=wishart_scale) for i in range(n_samples)])
-    log_q_z = log_q_s0 + log_q_D
-
-# ---------------------------------------------
-        # Prior / Laplace density
-# ---------------------------------------------------------
-
-
-    if laplace_prior:
-      prior = laplace_approximation(
-            force_recompute=False)
-
-    log_target_minus_log_q = np.empty(n_samples)
-
-    q_signal = (
-        np.sqrt(gtab.bvals[:, None])
-        * gtab.bvecs
-    )
-
-    for i in range(n_samples):
-
-        S0_i = S0_samples[i]
-        D_i = D_samples[i]
-
-        # ---------------------------------------------
-        # Likelihood
-        # ---------------------------------------------
-        predicted_signal = (
-            S0_i
-            * np.exp(
-                -np.einsum(
-                    "ij,jk,ik->i",
-                    q_signal,
-                    D_i,
-                    q_signal
-                )
-            )
+        S0_samples = gamma.rvs(
+            a=gamma_shape,
+            scale=gamma_scale,
+            size=n_samples,
+            random_state=rng,
         )
 
-        log_likelihood = np.sum(
-            norm.logpdf(
-                y,
-                loc=predicted_signal,
-                scale=likelihood.sigma
-            )
+        D_samples = wishart.rvs(
+            df=nu_param,
+            scale=wishart_scale,
+            size=n_samples,
+            random_state=rng,
         )
 
-        # ---------------------------------------------
-        # Prior / Laplace density
-        # ---------------------------------------------
-        if laplace_prior:
-            #Transform to laplace coordinates
-            theta_i = np.concatenate([
-                [np.log(S0_i)],
-                theta_from_D(D_i)
-            ])
+        D_samples = np.asarray(D_samples)
 
-            log_prior = prior.logpdf(theta_i)
+        if D_samples.ndim == 2:
+            D_samples = D_samples[None, :, :]
 
+        # q(S0, D) in physical coordinates
+        log_q_S0 = gamma.logpdf(S0_samples, a=gamma_shape, scale=gamma_scale)
+        log_q_D = np.array([wishart.logpdf(D_samples[i], df=nu_param, scale=wishart_scale) for i in range(n_samples)])
+        log_q = log_q_S0 + log_q_D
 
-            # Transform proposal q(z) -> q(theta)
-            log_jacobian = log_abs_det_z_wrt_theta(
-                theta_i
-            )
+    else:
+        # Laplace Gaussian q_L(theta)
+        laplace = laplace_approximation(force_recompute=False)
 
-            log_q_theta = (
-                log_q_z[i]
-                + log_jacobian
-            )
+        # Sample directly in the seven-dimensional theta-space.
+        theta_samples = rng.multivariate_normal(mean=laplace.mean, cov=laplace.cov, size=n_samples,)
+        theta_samples = np.atleast_2d(theta_samples)
 
-            log_target_minus_log_q[i] = (
-                log_prior
-                + log_likelihood
-                - log_q_theta
-            )
+        # Transform theta -> S0, D.
+        S0_samples = np.exp(theta_samples[:, 0])
 
-        else:
+        D_samples = np.asarray(D_from_theta(theta_samples[:, 1:]))
 
-            evals_i = evals_samples[i]
-            evecs_i = evecs_samples[i]
+        if D_samples.ndim == 2:
+            D_samples = D_samples[None, :, :]
 
-            log_prior = (
-                frozen_prior_instance.logpdf(
-                    S0_i,
-                    evals_i,
-                    evecs_i
-                )
-            )
+        # Density of the actual proposal, in theta-space.
+        log_q = np.asarray(laplace.logpdf(theta_samples)).reshape(-1)
 
-            log_target_minus_log_q[i] = (
-                log_prior
-                + log_likelihood
-                - log_q_z[i]
-            )
+    # Convert D samples to eigenvalues/eigenvectors
+    evals_samples, evecs_samples = np.linalg.eigh(D_samples)
 
 
-    # Normalize weights
-    log_weights = (
-        log_target_minus_log_q
-        - logsumexp(log_target_minus_log_q)
-    )
+    #  Evaluate the original target density
+    # log_joint_D includes the original prior, likelihood, and the eigenvalue-to-D density correction.
+
+    # The result is a density in (S0, D) coordinates.
+    log_target_z = log_joint_D(S0_samples, D_samples, prior, likelihood, include_jacobian=True)
+
+
+
+    # Calculate importance weights
+
+    if proposal == "original":
+        # Target and proposal are both densities in (S0, D).
+        log_unnormalized_weights = log_target_z - log_q
+
+    else:
+        # Convert target density from (S0, D) to theta-space.
+        log_jacobian = np.array([
+            log_abs_det_z_wrt_theta(theta)
+            for theta in theta_samples
+        ])
+        log_target_theta = log_target_z + log_jacobian
+        # Both target and proposal are now densities in theta-space.
+        log_unnormalized_weights = log_target_theta - log_q
+
+    # Normalize weights stably
+    log_normalizer = logsumexp(log_unnormalized_weights)
+
+    if not np.isfinite(log_normalizer):
+        raise RuntimeError(
+            "All importance weights are zero or invalid. "
+            "Check the proposal and target densities.")
+
+    log_weights = (log_unnormalized_weights - log_normalizer)
 
     importance_weights = np.exp(log_weights)
 
+    # Effective sample size
+    ess = 1 / np.sum(importance_weights ** 2)
 
-    # w is normalized importanc weights
-    eff_sample_size= 1/np.sum(importance_weights ** 2)
+    print(
+        f"Proposal: {proposal}\n"
+        f"ESS: {ess:.1f} / {n_samples} "
+        f"({ess / n_samples:.2%})"
+    )
 
-    print(f"Importance sampling ESS: "f"{eff_sample_size:.1f} / {n_samples} "f"({eff_sample_size / n_samples:.1%})")
+    return importance_weights, S0_samples, evals_samples, evecs_samples, ess
 
-    return importance_weights, S0_samples, evals_samples, evecs_samples, eff_sample_size
+
 
 
 # helper functions for VI
@@ -1404,17 +1356,28 @@ def main():
     plot_results(S0_mh[burn_in:], evals_mh[burn_in:], evecs_mh[burn_in:, :, :], evec_principal, method="mh")
 
 
-    # # Run Importance Sampling and plot results
+    # Run Importance Sampling and plot results
     gamma=[0.01, 0.05,0.1,0.2,0.5]
     nu=[4, 10, 100, 1000, 2000]
     #for g in gamma:
      #   print("Gamma= ", g)
       #  for n in nu:
        #   print("nu= ", n)
-        #  w_is, S0_is, evals_is, evecs_is, ess = importance_sampling(n_samples, gamma_param=g, nu_param=n, force_recompute=True)
-    w_is, S0_is, evals_is, evecs_is, ess = importance_sampling(n_samples, gamma_param=0.01, nu_param=1000,laplace_prior=False, force_recompute=True)
-    plot_results(S0_is, evals_is, evecs_is, evec_principal, weights=w_is, method="is")
-    #plt.savefig("result_importance.png")
+        #  w_is, S0_is, evals_is, evecs_is, ess = importance_sampling(n_samples, gamma_param=g, nu_param=n, proposal="original", random_seed=0, force_recompute=True)
+
+    # Original Gamma x Wishart proposal
+    w_original, S0_original, evals_original, evecs_original, ess_original = importance_sampling(n_samples=n_samples,
+        gamma_param=0.01, nu_param=1000, proposal="original", random_seed=0, force_recompute=True)
+
+    # Laplace Gaussian proposal
+    w_laplace, S0_laplace, evals_laplace, evecs_laplace, ess_laplace = importance_sampling(n_samples=n_samples,
+        gamma_param=0.01, nu_param=1000, proposal="laplace", random_seed=0, force_recompute=True)
+
+    plot_results(S0_original, evals_original, evecs_original, evec_principal, weights=w_original, method="is")
+    plt.savefig("result_importance_original.png")
+
+    plot_results(S0_laplace, evals_laplace, evecs_laplace, evec_principal, weights=w_laplace, method="is")
+    plt.savefig("result_importance_laplace.png")
 
 
 
