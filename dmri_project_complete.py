@@ -1493,6 +1493,8 @@ def plot_results(S0, evals, evecs, evec_ref, weights=None, method=""):
     axes[0, 1].hist(md, bins=n_bins, density=True, weights=weights,
                     alpha=0.7, color='green', edgecolor='black')
     axes[0, 1].set_xlabel("Mean diffusivity")
+    # set scientific scale for x axis
+    axes[0, 1].ticklabel_format(axis='x', style='sci', scilimits=(0,0))
     axes[0, 1].set_ylabel("Density")
 
     axes[1, 0].hist(fa, bins=n_bins, density=True, weights=weights,
