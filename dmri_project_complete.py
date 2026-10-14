@@ -82,6 +82,9 @@ import dipy.reconst.dti as dti                     # for diffusion tensor model 
 
 import argparse
 
+
+from matplotlib.ticker import MaxNLocator
+
 """
 =============================================================================
 Caching Utility (already implemented)
@@ -1345,7 +1348,7 @@ def main():
 
     # Run MH and report summaries only after discarding burn-in.
     from time import perf_counter
-    from dmri_project_mh import plot_mh_results
+    #from dmri_project_mh import plot_mh_results
 
     start_mh = perf_counter()
     S0_mh, evals_mh, evecs_mh, diagnostics = metropolis_hastings(
@@ -1428,6 +1431,100 @@ def main():
 
 
     print("Done.")
+
+
+def plot_mh_results(
+    S0,
+    evals,
+    evecs,
+    evec_ref,
+    diagnostics,
+    burn_in,
+    output_dir="APML_report",
+):
+    """Create posterior and trace plots and return their paths."""
+    #output_dir = Path(output_dir)
+    #output_dir.mkdir(parents=True, exist_ok=True)
+
+    S0_post = np.asarray(S0[burn_in:])
+    evals_post = np.asarray(evals[burn_in:])
+    evecs_post = np.asarray(evecs[burn_in:])
+    md = np.mean(evals_post, axis=-1)
+    fa = np.sqrt(
+        1.5
+        * np.sum((evals_post - md[:, None]) ** 2, axis=-1)
+        / np.sum(evals_post**2, axis=-1)
+    )
+    cosine = np.abs(np.einsum("ni,i->n", evecs_post[:, :, 2], evec_ref))
+    angle = np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0)))
+
+    values = [S0_post, md, fa, angle]
+    labels = [
+        r"Baseline signal $S_0$",
+        "Mean diffusivity",
+        "Fractional anisotropy",
+        "Acute angle (degrees)",
+    ]
+    colors = ["#c44e52", "#55a868", "#4c72b0", "#8172b2"]
+    n_bins = max(20, int(np.sqrt(len(S0_post))))
+
+    fig, axes = plt.subplots(2, 2, figsize=(9, 7))
+    for axis, samples, label, color in zip(
+        axes.ravel(), values, labels, colors
+    ):
+        axis.hist(
+            samples,
+            bins=n_bins,
+            density=True,
+            color=color,
+            alpha=0.8,
+            edgecolor="white",
+        )
+        axis.set_xlabel(label)
+        axis.set_ylabel("Density")
+        axis.xaxis.set_major_locator(MaxNLocator(5))
+        if label == "Mean diffusivity":
+            axis.ticklabel_format(axis="x", style="sci", scilimits=(-3, 3))
+        axis.grid(alpha=0.2)
+    fig.suptitle(
+        "Metropolis-Hastings posterior "
+        f"(acceptance {diagnostics['acceptance_rate']:.1%})"
+    )
+    fig.tight_layout()
+    #posterior_path = output_dir / "results_mh.png"
+    #fig.savefig(posterior_path, dpi=300, bbox_inches="tight")
+    plt.plot()
+    #plt.close(fig)
+
+    full_md = np.mean(evals, axis=-1)
+    full_fa = np.sqrt(
+        1.5
+        * np.sum((evals - full_md[:, None]) ** 2, axis=-1)
+        / np.sum(evals**2, axis=-1)
+    )
+    traces = [S0, full_md, full_fa, diagnostics["log_posterior"]]
+    trace_labels = [r"$S_0$", "MD", "FA", "Log posterior"]
+
+    fig, axes = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
+    for axis, trace, label in zip(axes, traces, trace_labels):
+        axis.plot(trace, linewidth=0.55, color="#4c72b0")
+        axis.axvline(burn_in, color="#c44e52", linestyle="--", linewidth=1)
+        axis.set_ylabel(label)
+        axis.grid(alpha=0.2)
+    axes[-1].set_xlabel("Iteration")
+    fig.suptitle(
+        "Metropolis-Hastings traces "
+        f"($\\gamma$={diagnostics['gamma']:g}, "
+        f"$\\nu$={diagnostics['nu']:g})"
+    )
+    fig.tight_layout()
+    #trace_path = output_dir / "trace_mh.png"
+    #fig.savefig(trace_path, dpi=300, bbox_inches="tight")
+    plt.plot()
+    #plt.close(fig)
+
+    return "posterior_path", "trace_path" #trace_path
+
 
 
 def plot_learning_curve(learning_curve, hyperparams, method="vi"):
